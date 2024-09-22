@@ -1,38 +1,43 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri May 17 23:36:50 2024
+
+@author: sangwonchae
+This is to share Yahoo News via Telegram
+"""
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import asyncio
 import requests
 from bs4 import BeautifulSoup
+from telegram import Bot, error as telegram_error
 import re
-import boto3
+import sqlite3
 from datetime import datetime
 
-# 텔레그램 봇 설정 (환경 변수에서 읽기)
-# 한국 뉴스용
-KOREAN_TOKEN = os.environ['TELEGRAM_KOREAN_TOKEN']
-KOREAN_CHAT_ID = os.environ['TELEGRAM_KOREAN_CHAT_ID']
-korean_bot_api_url = f'https://api.telegram.org/bot{KOREAN_TOKEN}/sendMessage'
+# 텔레그램 봇 설정
+#TOKEN = '6821721487:AAHsHBfSUF5TbwsvcyF4sbQ9C7Jum1P8FW0'
+#CHAT_ID = '-1001928078035'
+TOKEN = '6996569159:AAE8L14LimEkhj8q73zM1ZuVIZvh0JfY8Ng'
+CHAT_ID = '-1002025567712'
+bot = Bot(token=TOKEN)
 
-# 미국 뉴스용
-AMERICAN_TOKEN = os.environ['TELEGRAM_AMERICAN_TOKEN']
-AMERICAN_CHAT_ID = os.environ['TELEGRAM_AMERICAN_CHAT_ID']
-american_bot_api_url = f'https://api.telegram.org/bot{AMERICAN_TOKEN}/sendMessage'
+# 데이터베이스 연결 및 테이블 생성
+conn = sqlite3.connect('ynews_sent.db')
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS news_items (
+        title TEXT PRIMARY KEY,
+        link TEXT,
+        date_sent TEXT
+    )
+''')
+conn.commit()
 
-# DynamoDB 클라이언트 생성
-dynamodb = boto3.resource('dynamodb')
-table = dynamodb.Table('news_items')  # 기존 테이블 사용, 필요 시 분리 가능
-
-def lambda_handler(event, context):
-    print("Lambda 함수 시작")
-    send_korean_news()
-    send_american_news()
-    print("Lambda 함수 종료")
-    return {
-        'statusCode': 200,
-        'body': 'Success'
-    }
-
-# 한국 뉴스 관련 함수들
-def fetch_korean_news(url):
-    headers = {'User-Agent': 'Mozilla/5.0'}
+async def fetch_korean_news(url):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36'}
     response = requests.get(url, headers=headers)
     news_items = []
 
@@ -49,38 +54,22 @@ def fetch_korean_news(url):
                 # 링크에서 날짜 필터링
                 match = re.search(r"date=(\d+)", link)
                 if match and match.group(1) == today:
-                    # DynamoDB에서 중복 메시지 확인
-                    if not is_news_sent(title):
+                    # 중복 메시지 확인
+                    cursor.execute("SELECT * FROM news_items WHERE title=?", (title,))
+                    if not cursor.fetchone():
                         # 링크에서 article_id와 office_id 추출
                         match = re.search(r"article_id=(\d+)&office_id=(\d+)", link)
                         if match:
                             article_id = match.group(1)
                             office_id = match.group(2)
                             new_link = f"https://n.news.naver.com/mnews/article/{office_id}/{article_id}"
-                            news_items.append((title, new_link))
-                            # DynamoDB에 추가
-                            save_news_item(title, new_link)
-    else:
-        print(f"Error fetching Korean news: {response.status_code}")
+                            news_items.append(f"{title}\n{new_link}")
+                            # DB에 추가
+                            cursor.execute("INSERT INTO news_items (title, link, date_sent) VALUES (?, ?, ?)", (title, new_link, today))
+                            conn.commit()
     return news_items
 
-def send_korean_news():
-    print("Sending Korean news")
-    korean_urls = [
-        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=401',
-        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=402',
-        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=403',
-        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=404',
-        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=429'
-    ]
-    for url in korean_urls:
-        news_items = fetch_korean_news(url)
-        for title, link in news_items:
-            message = f"{title}\n{link}"
-            send_message(korean_bot_api_url, KOREAN_CHAT_ID, message)
-
-# 미국 뉴스 관련 함수들
-def fetch_american_news(url):
+async def fetch_american_news(url):
     response = requests.get(url)
     news_items = []
 
@@ -89,22 +78,30 @@ def fetch_american_news(url):
         h3_tags = soup.find_all('h3', class_='Mb(5px)')
 
         for h3 in h3_tags:
-            a_tag = h3.find('a')
+            a_tag = h3.find('a', class_='Fw(b) Fz(18px) Lh(23px) LineClamp(2,46px) Fz(17px)--sm1024 Lh(19px)--sm1024 LineClamp(2,38px)--sm1024 mega-item-header-link Td(n) C(#0078ff):h C(#000) LineClamp(2,46px) LineClamp(2,38px)--sm1024 not-isInStreamVideoEnabled')
             if a_tag:
                 title = a_tag.text.strip()
                 link = a_tag['href']
                 full_link = f"https://finance.yahoo.com{link}" if link.startswith('/') else link
-                # DynamoDB에서 중복 메시지 확인
-                if not is_news_sent(title):
-                    news_items.append((title, full_link))
-                    # DynamoDB에 추가
-                    save_news_item(title, full_link)
-    else:
-        print(f"Error fetching American news: {response.status_code}")
+                # 중복 메시지 확인
+                cursor.execute("SELECT * FROM news_items WHERE title=?", (title,))
+                if not cursor.fetchone():
+                    news_items.append(f"{title}\n{full_link}")
+                    # DB에 추가
+                    today = datetime.now().strftime("%Y%m%d")
+                    cursor.execute("INSERT INTO news_items (title, link, date_sent) VALUES (?, ?, ?)", (title, full_link, today))
+                    conn.commit()
     return news_items
 
-def send_american_news():
-    print("Sending American news")
+async def send_news():
+    korean_urls = [
+        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=401',
+        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=402',
+        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=403',
+        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=404',
+        'https://finance.naver.com/news/news_list.naver?mode=LSS3D&section_id=101&section_id2=258&section_id3=429'
+    ]
+    
     american_urls = [
         "https://finance.yahoo.com/topic/latest-news/", 
         "https://finance.yahoo.com/topic/stock-market-news",
@@ -113,51 +110,43 @@ def send_american_news():
         "https://finance.yahoo.com/topic/tech",
         "https://finance.yahoo.com/topic/crypto"
     ]
-    for url in american_urls:
-        news_items = fetch_american_news(url)
-        for title, link in news_items:
-            message = f"{title}\n{link}"
-            send_message(american_bot_api_url, AMERICAN_CHAT_ID, message)
-
-# 공통 함수들
-def send_message(bot_api_url, chat_id, text):
-    payload = {
-        'chat_id': chat_id,
-        'text': text
-    }
-    try:
-        response = requests.post(bot_api_url, data=payload, timeout=10)
-        response.raise_for_status()
-        print(f"Message sent to chat_id {chat_id}: {text}")
-    except requests.exceptions.HTTPError as e:
-        if response.status_code == 429:
-            retry_after = int(response.headers.get('Retry-After', 1))
-            print(f"Rate limited by Telegram. Retrying after {retry_after} seconds.")
-            time.sleep(retry_after)
+    
+    # Fetch and send Korean news
+    '''for url in korean_urls:
+        news_items = await fetch_korean_news(url)
+        for item in news_items:
             try:
-                response = requests.post(bot_api_url, data=payload, timeout=10)
-                response.raise_for_status()
-                print(f"Message sent after retry to chat_id {chat_id}: {text}")
+                await bot.send_message(chat_id=CHAT_ID, text=item)
+                print(item)
+                await asyncio.sleep(1)  # 각 메시지 전송 사이에 딜레이 추가
             except Exception as e:
-                print(f"Failed to send message after retry: {e}")
-        else:
-            print(f"Error sending message to chat_id {chat_id}: {e}")
-    except Exception as e:
-        print(f"Unexpected error sending message to chat_id {chat_id}: {e}")
+                print(f"Error sending message: {e}")
+                if isinstance(e, telegram_error.RetryAfter):
+                    retry_delay = e.retry_after + 1
+                    print(f"Retrying after {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    await bot.send_message(chat_id=CHAT_ID, text=item)
+    '''                
+    # Fetch and send American news
+    for url in american_urls:
+        news_items = await fetch_american_news(url)
+        for item in news_items:
+            try:
+                await bot.send_message(chat_id=CHAT_ID, text=item)
+                print(item)
+                await asyncio.sleep(3)  # 각 메시지 전송 사이에 딜레이 추가
+            except Exception as e:
+                print(f"Error sending message: {e}")
+                if isinstance(e, telegram_error.RetryAfter):
+                    retry_delay = e.retry_after + 1
+                    print(f"Retrying after {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    await bot.send_message(chat_id=CHAT_ID, text=item)
 
-def is_news_sent(title):
-    print(f"Checking if news is sent: {title}")
-    try:
-        response = table.get_item(Key={'title': title})
-        return 'Item' in response
-    except Exception as e:
-        print(f"Error checking DynamoDB: {e}")
-        return False
+async def run_scheduler():
+    while True:
+        await send_news()
+        await asyncio.sleep(1800)  # 30분마다 반복
 
-def save_news_item(title, link):
-    print(f"Saving news item: {title}")
-    try:
-        today = datetime.now().strftime("%Y%m%d")
-        table.put_item(Item={'title': title, 'link': link, 'date_sent': today})
-    except Exception as e:
-        print(f"Error saving to DynamoDB: {e}")
+if __name__ == '__main__':
+    asyncio.run(run_scheduler())
